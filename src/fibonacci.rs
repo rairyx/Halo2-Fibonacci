@@ -24,6 +24,7 @@ struct Config {
     elem_2: Column<Advice>,
     elem_3: Column<Advice>,
     q_fib: Selector,
+    instance: Column<Instance>,
 }
 
 impl Config {
@@ -35,7 +36,11 @@ impl Config {
         let elem_2 = cs.advice_column();
         cs.enable_equality(elem_2);
         let elem_3 = cs.advice_column();
+
+        let instance = cs.instance_column();  
         cs.enable_equality(elem_3);
+        cs.enable_equality(instance);
+
         let q_fib = cs.selector();
 
         cs.create_gate("fibonacci", |virtual_cells| {
@@ -45,12 +50,12 @@ impl Config {
             let elem_3 = virtual_cells.query_advice(elem_3, Rotation::cur());
 
             vec![
-                //     q_fib * (elem_1 + elem_2 - elem_3) = 0
+               
                 q_fib * (elem_1 + elem_2 - elem_3),
             ]
         });
 
-        Self { elem_1, elem_2, elem_3, q_fib }
+        Self { elem_1, elem_2, elem_3, q_fib, instance }
     }
 
     fn init<F: Field>(
@@ -73,7 +78,7 @@ impl Config {
 
             // Assign elem_2
             let elem_2 = region.assign_advice(|| "elem_2", self.elem_2, offset, || elem_2)?;
-
+           // let elem_3 = elem_1;
             let elem_3 = elem_1 + elem_2.value_field().evaluate();
             // Assign elem_3
             let elem_3 = region.assign_advice(|| "elem_3", self.elem_3, offset, || elem_3)?;
@@ -89,13 +94,13 @@ impl Config {
     fn assign<F: Field>(
         &self,
         mut layouter: impl Layouter<F>,
-        elem_2: AssignedCell<F, F>,
-        elem_3: AssignedCell<F, F>,
+        elem_2: &AssignedCell<F, F>,
+        elem_3: &AssignedCell<F, F>,
     ) -> Result<(
         AssignedCell<F, F>, // elem_2
         AssignedCell<F, F> // elem_3
     ), Error> {
-        layouter.assign_region(|| "steady-state Fibonacci", |mut region| {
+        layouter.assign_region(|| "next row", |mut region| {
             let offset = 0;
 
             // Enable q_fib
@@ -106,11 +111,13 @@ impl Config {
 
             // Copy elem_2 (which is the previous elem_3)
             let elem_2 = elem_3.copy_advice(|| "copy elem_3 into current elem_2", &mut region, self.elem_2, offset)?;
-
             let elem_3 = elem_1.value_field().evaluate() + elem_2.value_field().evaluate();
+            //comment next line makes constaint not satified 
+           // let elem_3 = elem_1.value_field().evaluate() + elem_2.value_field().evaluate() + elem_2.value_field().evaluate();
             // Assign elem_3
             let elem_3 = region.assign_advice(|| "elem_3", self.elem_3, offset, || elem_3)?;
-
+            
+           
             Ok((
                 elem_2,
                 elem_3
@@ -118,6 +125,20 @@ impl Config {
 
         })
     }
+
+    fn expose_public<F:Field>(
+        &self,
+        mut layouter: impl Layouter<F>,
+        cell: &AssignedCell<F,F>,
+        row: usize,
+    ) -> Result<(), Error> {
+        
+        layouter.constrain_instance(cell.cell(), self.instance, row)
+
+
+    }
+
+    
 }
 
 #[cfg(test)]
@@ -129,9 +150,9 @@ mod tests {
 /*
     1, 1, 2, 3, 5, 8, 13, ...
 
-    | elem_1 | elem_2 | sum | q_fib
+    | elem_1 | elem_2 | sum | q_fib | instance
     --------------------------------
-    |    1   |    1   |  2  |   1
+    |    1   |    1   |  2  |   1   | 55
     |    1   |    2   |  3  |   1
     |    2   |    3   |  5  |   1
     |        |        |     |   0
@@ -142,10 +163,13 @@ mod tests {
 
 
     #[derive(Default)]
-    struct MyCircuit<F: Field> {
+   
+   struct MyCircuit<F: Field> {
         elem_1: Value<F>, // 1
         elem_2: Value<F>, // 1
+      
     }
+
 
     impl<F: Field> Circuit<F> for MyCircuit<F> {
         type Config = Config;
@@ -162,23 +186,55 @@ mod tests {
 
         fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<F>) -> Result<(), Error> {
             // elem_2 = 1, elem_3 = 2
-            let (elem_2, elem_3) = config.init(layouter.namespace(|| "init"), self.elem_1, self.elem_2)?;
+            let (mut elem_2, mut elem_3) = config.init(layouter.namespace(|| "init"), self.elem_1, self.elem_2)?;
+        
             // 1 + 2 = 3
-            config.assign(layouter.namespace(|| "first assign after init"), elem_2, elem_3)?;
-
+            for _i in 3..10 {
+             let (_, new_elem_3) = config.assign(layouter.namespace(|| "next row"), &elem_2, &elem_3)?;
+            
+             elem_2 = elem_3; 
+             elem_3 = new_elem_3; 
+        
+            }
+            config.expose_public(layouter, &elem_3, 0)?;
             Ok(())
         }
     }
 
     #[test]
     fn test_fib() {
-
+     
         let circuit = MyCircuit {
+
             elem_1: Value::known(Fp::one()),
             elem_2: Value::known(Fp::one()),
         };
-
-        let prover = MockProver::run(3, &circuit, vec![]).unwrap();
+        let instance = Fp::from(55);
+        let mut public_input = vec![instance];
+        let prover = MockProver::run(5, &circuit, vec![public_input]).unwrap();
+        
         prover.assert_satisfied();
+    }
+
+    #[cfg(feature = "dev-graph")]
+    #[test]
+    fn print_fibo() {
+        use plotters::prelude::*;
+        let root = BitMapBackend::new("fib-layout.png", (1024, 3096)).into_drawing_area();
+        root.fill(&WHITE).unwrap();
+        let root = root.titled("Fib Layout", ("sans-serif", 60)).unwrap();
+
+        let circuit = MyCircuit {
+
+            elem_1: Value::known(Fp::one()),
+            elem_2: Value::known(Fp::one()),
+       
+        };
+        halo2_proofs::dev::CircuitLayout::default()
+            .render(5, &circuit, &root)
+            .unwrap();
+
+        let dot_string = halo2_proofs::dev::circuit_dot_graph(&circuit);    
+        print!("{}", dot_string);
     }
 }
